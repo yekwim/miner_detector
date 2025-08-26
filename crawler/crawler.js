@@ -102,9 +102,12 @@ class AdvancedCrawler extends EventEmitter {
 
   async createOutputDir(targetUrl) {
     const domain = new URL(targetUrl).hostname.replace(/[^a-zA-Z0-9]/g, '_');
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const dirName = `crawl_${domain}_${timestamp}`;
-    const baseDir = path.join(process.cwd(), 'crawl_output', dirName);
+    const baseDir = path.join(process.cwd(), 'crawl_output', domain);
+
+    // Remove o diretório se já existir
+    try {
+      await fs.rm(baseDir, { recursive: true, force: true });
+    } catch {}
 
     const dirs = ['html', 'js', 'wasm', 'workers', 'json'];
     await Promise.all(dirs.map((d) => fs.mkdir(path.join(baseDir, d), { recursive: true })));
@@ -159,9 +162,6 @@ class AdvancedCrawler extends EventEmitter {
     } catch (error) {
       this.state.failedUrls.add(url);
       this.emit('pageError', { url, depth, isExternal, error: error.message });
-    } finally {
-      if (page) await page.close().catch(() => {});
-      this.state.activePages--;
       this.state.crawledCount++;
     }
   }
@@ -570,7 +570,12 @@ class AdvancedCrawler extends EventEmitter {
   }
 
   isWasmResponse(response, url) {
-    const headers = response.headers?.() || {};
+    let headers = {};
+    if (typeof response.headers === 'function') {
+      headers = response.headers() || {};
+    } else if (typeof response.headers === 'object') {
+      headers = response.headers || {};
+    }
     const ct = (headers['content-type'] || '').toLowerCase();
     const mt = (response.mimeType || '').toLowerCase();
     const u = url.toLowerCase();

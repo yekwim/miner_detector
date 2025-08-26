@@ -1,185 +1,147 @@
-// Parser v2 — normalização + tokens + chunking (300–800) + JSONL
-// Uso: node parser_v2.js <crawl_output_dir> [--out=dir] [--min=300] [--max=800] [--overlap=80] [--no-ast]
+// parser_v2.js — normalização + textos para embeddings (sem chunking)
+// Uso: node parser_v2.js <crawl_output_dir> [--out=dir] [--no-ast]
+//
+// Saídas:
+//  - <out>/embedding_texts.jsonl         (por arquivo; texto normalizado para embeddings)
+//  - <out>/norm/<sha|base>.js.tokens.txt (tokens semânticos do JS)
+//  - <out>/norm/<sha|base>.wat           (WAT normalizado)
+//  - <out>/norm/<sha|base>.wat.opseq.txt (sequência de opcodes do WAT)
+//  - <out>/ast/<sha|base>.js.ast.json    (opcional)
+//  - <out>/summary.json
 
 const fs = require('fs').promises;
 const fssync = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-
 const esprima = require('esprima');
 const estraverse = require('estraverse');
-const { encode, decode } = require('gpt-tokenizer');
 
-// ------------------------ util ------------------------
+// -------------- util --------------
 const exists = async p => !!(await fs.stat(p).catch(()=>false));
-const mkdirp = p => fs.mkdir(p, { recursive: true });
-
-function readLines(filePath) {
+async function mkdirp(p){ await fs.mkdir(p, {recursive: true}); }
+function nowIso(){ return new Date().toISOString(); }
+function readLines(filePath){
   const data = fssync.readFileSync(filePath, 'utf8');
   return data.split(/\r?\n/).filter(Boolean).map(l => JSON.parse(l));
 }
-
-function nowIso() { return new Date().toISOString(); }
-
-function sanitizeBase(u) {
+function sanitizeBase(u){
   try {
     const base = path.basename(u || 'resource');
     return base.replace(/\.[^.]*$/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
   } catch { return 'resource'; }
 }
 
-// ------------------------ chunking ------------------------
-function chunkByTokens(text, { minT=300, maxT=800, overlap=80 } = {}) {
-  const ids = encode(text); // GPT BPE
-  const chunks = [];
-  if (ids.length === 0) return [];
-  let start = 0;
-  while (start < ids.length) {
-    let end = Math.min(start + maxT, ids.length);
-    if (end - start < minT && end < ids.length) {
-      end = Math.min(start + minT, ids.length);
-    }
-    const slice = ids.slice(start, end);
-    chunks.push({
-      n_tokens: slice.length,
-      text: decode(Uint32Array.from(slice)),
-    });
-    if (end === ids.length) break;
-    start = end - Math.min(overlap, end); // desliza com overlap
+// -------------- JS → tokens semânticos --------------
+function memberToStr(m){
+  if(!m) return '<?>'
+  if(m.type === 'Identifier') return m.name;
+  if(m.type === 'Literal') return String(m.value);
+  if(m.type === 'MemberExpression'){
+    return `${memberToStr(m.object)}.${memberToStr(m.property)}`
   }
-  return chunks;
+  return m.type;
 }
-
-// ------------------------ JS normalização → tokens ------------------------
-function jsToSemanticTokens(jsCode) {
-  // Remove comentários e espaços extras rápido, sem quebrar semântica
+function jsToSemanticTokens(jsCode){
   const code = jsCode
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/\/\/[^\n\r]*/g, '')
     .replace(/\s+/g, ' ')
     .trim();
-
-  // AST
-  const ast = esprima.parseScript(code, { tolerant: true, range: true, loc: false });
-
-  // Caminho pré-ordem, registrando tipos de nó e algumas chamadas sensíveis
   const toks = [];
+  let ast;
+  try{
+    ast = esprima.parseScript(code, { tolerant: true });
+  }catch{
+    // fallback: devolve código compactado
+    return code;
+  }
   estraverse.traverse(ast, {
-    enter(node) {
+    enter(node){
       toks.push(node.type);
-      // Chamadas sensíveis
-      if (node.type === 'CallExpression') {
-        // nome simples
-        if (node.callee && node.callee.type === 'Identifier') {
+      if(node.type === 'CallExpression'){
+        if(node.callee?.type === 'Identifier'){
           toks.push(`Call(${node.callee.name})`);
-        }
-        // obj.prop
-        if (node.callee && node.callee.type === 'MemberExpression') {
-          const obj = memberToStr(node.callee.object);
-          const prop = memberToStr(node.callee.property);
-          toks.push(`Call(${obj}.${prop})`);
+        } else if (node.callee?.type === 'MemberExpression'){
+          toks.push(`Call(${memberToStr(node.callee.object)}.${memberToStr(node.callee.property)})`);
         }
       }
-      // New Worker, WebSocket etc
-      if (node.type === 'NewExpression' && node.callee) {
-        const name = node.callee.type === 'Identifier'
-          ? node.callee.name
-          : memberToStr(node.callee);
+      if(node.type === 'NewExpression' && node.callee){
+        const name = node.callee.type === 'Identifier' ? node.callee.name : memberToStr(node.callee);
         toks.push(`New(${name})`);
       }
     }
   });
-
-  // Heurísticas de orquestração típicas
-  const shallowFlags = [];
-  if (/WebAssembly\.(instantiate|compile)/.test(code)) shallowFlags.push('WebAssembly');
-  if (/WebSocket\s*\(/.test(code)) shallowFlags.push('WebSocket');
-  if (/new\s+Worker\s*\(/.test(code)) shallowFlags.push('Worker');
-  if (/postMessage\s*\(/.test(code)) shallowFlags.push('postMessage');
-  toks.push(...shallowFlags.map(f => `Flag(${f})`));
-
-  // Sequência final
-  return toks.join(' ');
+  if(/WebAssembly\.(instantiate|compile)/.test(code)) toks.push('Flag(WebAssembly)');
+  if(/WebSocket\s*\(/.test(code)) toks.push('Flag(WebSocket)');
+  if(/new\s+Worker\s*\(/.test(code)) toks.push('Flag(Worker)');
+  if(/postMessage\s*\(/.test(code)) toks.push('Flag(postMessage)');
+  return toks.join(' ').trim();
 }
 
-function memberToStr(m) {
-  if (!m) return '<?>';
-
-  if (m.type === 'Identifier') return m.name;
-  if (m.type === 'Literal') return String(m.value);
-
-  if (m.type === 'MemberExpression') {
-    const left = memberToStr(m.object);
-    const right = memberToStr(m.property);
-    return `${left}.${right}`;
-  }
-  return m.type;
-}
-
-// ------------------------ WAT normalização → opcodes ------------------------
-function normalizeWatText(wat) {
-  // remove comentários (; ;) e ;; linha
+// -------------- WASM → WAT → opcodes --------------
+function normalizeWatText(wat){
   let t = wat.replace(/\(\;[\s\S]*?\;\)/g, '').replace(/;;.*$/gm, '');
-  // normaliza nomes $foo → $id
-  t = t.replace(/\$[A-Za-z_][\w\-]*/g, '$id');
-  // números → NUM
-  t = t.replace(/([-+]?\d+(\.\d+)?([eE][-+]?\d+)?)/g, 'NUM');
-  // espaços
+  t = t.replace(/\$[A-Za-z_][\w\-]*/g, '$id'); // nomes
+  t = t.replace(/([-+]?\d+(\.\d+)?([eE][-+]?\d+)?)/g, 'NUM'); // números
   t = t.replace(/\s+/g, ' ').trim();
   return t;
 }
-
-function watToOpcodeTokens(watText) {
-  const t = watText;
+function watToOpcodeTokens(watText){
   const opRegex = /\b(i32\.\w+|i64\.\w+|f32\.\w+|f64\.\w+|local\.(?:get|set|tee)|global\.(?:get|set)|memory\.(?:grow|size)|call|call_indirect|block|loop|if|else|end|br_if|br|return|select|drop|unreachable)\b/g;
   const out = [];
-  let m;
-  while ((m = opRegex.exec(t)) !== null) out.push(m[0]);
+  let m; while((m = opRegex.exec(watText)) !== null) out.push(m[0]);
   return out.join(' ');
 }
-
-// ------------------------ WASM→WAT ------------------------
-async function wasmToWat(wasmPath) {
-  // tenta wasm-tools
-  const tryTool = (cmd, args) => new Promise((resolve) => {
-    const p = spawn(cmd, args);
-    let out = '', err = '';
-    p.stdout.on('data', d => out += String(d));
-    p.stderr.on('data', d => err += String(d));
-    p.on('close', code => resolve(code === 0 ? out : null));
-    p.on('error', () => resolve(null));
-  });
-
+async function wasmToWat(wasmPath){
+  async function tryTool(cmd, args){
+    return await new Promise(res=>{
+      const p = spawn(cmd, args);
+      let out = ''; p.stdout.on('data', d=> out += String(d));
+      p.on('close', c => res(c===0 ? out : null));
+      p.on('error', ()=> res(null));
+    });
+  }
   let wat = await tryTool('wasm-tools', ['print', wasmPath]);
-  if (wat) return wat;
-  wat = await tryTool('wasm2wat', [wasmPath]);
-  return wat; // pode ser null
+  if(wat) return wat;
+  return await tryTool('wasm2wat', [wasmPath]);
 }
 
-// ------------------------ processamento principal ------------------------
-async function main() {
+// -------------- manifest fallback --------------
+async function fallbackEnumerate(jsDir, wasmDir, workersDir){
+  const list = [];
+  if(await exists(jsDir)){
+    for (const f of await fs.readdir(jsDir)) if (f.endsWith('.js'))
+      list.push({ type: 'js', path: path.join(jsDir, f), url: '', sha256: null });
+  }
+  if(await exists(workersDir)){
+    for (const f of await fs.readdir(workersDir)) if (f.endsWith('.js'))
+      list.push({ type: 'js', path: path.join(workersDir, f), url: '', sha256: null });
+  }
+  if(await exists(wasmDir)){
+    for (const f of await fs.readdir(wasmDir)) if (f.endsWith('.wasm'))
+      list.push({ type: 'wasm', path: path.join(wasmDir, f), url: '', sha256: null });
+  }
+  return list;
+}
+
+// -------------- main --------------
+async function main(){
   const crawlDir = process.argv[2];
-  if (!crawlDir) {
-    console.error('Uso: node parser_v2.js <crawl_output_dir> [--out=dir] [--min=300] [--max=800] [--overlap=80] [--no-ast]');
+  if(!crawlDir){
+    console.error('Uso: node parser_v2.js <crawl_output_dir> [--out=dir] [--no-ast]');
     process.exit(1);
   }
-
   const args = process.argv.slice(3);
   const getArg = (k, d) => {
-    const a = args.find(x => x.startsWith(k + '='));
+    const a = args.find(x => x.startsWith(k+'='));
     return a ? a.split('=')[1] : d;
   };
-
-  const outDir = getArg('--out', path.join(process.cwd(), 'parser_output'));
-  const minT = parseInt(getArg('--min', '300'), 10);
-  const maxT = parseInt(getArg('--max', '800'), 10);
-  const overlap = parseInt(getArg('--overlap', '80'), 10);
+  const outDir = getArg('--out', path.join(process.cwd(), 'data', 'parser_output'));
   const genAST = !args.includes('--no-ast');
 
   await mkdirp(outDir);
-  await mkdirp(path.join(outDir, 'ast'));
   await mkdirp(path.join(outDir, 'norm'));
-  await mkdirp(path.join(outDir, 'chunks'));
+  if(genAST) await mkdirp(path.join(outDir, 'ast'));
 
   const manifestPath = path.join(crawlDir, 'manifest.jsonl');
   const jsDir = path.join(crawlDir, 'js');
@@ -190,124 +152,72 @@ async function main() {
     ? readLines(manifestPath)
     : await fallbackEnumerate(jsDir, wasmDir, workersDir);
 
-  const chunksJSONL = path.join(outDir, 'chunks', 'embeddings_chunks.jsonl');
-  const chunksStream = fssync.createWriteStream(chunksJSONL, { flags: 'w' });
+  const outJSONL = path.join(outDir, 'embedding_texts.jsonl');
+  const stream = fssync.createWriteStream(outJSONL, { flags: 'w' });
 
-  let stats = { js: 0, wasm: 0, chunks: 0, ast: 0, errors: 0 };
+  const stats = { js: 0, wasm: 0, ast: 0, errors: 0, written: 0 };
 
-  for (const rec of items) {
-    try {
-      if (rec.type === 'js') {
+  for (const rec of items){
+    try{
+      if(rec.type === 'js'){
         const text = await fs.readFile(rec.path, 'utf8');
         const tokens = jsToSemanticTokens(text);
         const base = rec.sha256 || sanitizeBase(rec.url || rec.path);
         await fs.writeFile(path.join(outDir, 'norm', `${base}.js.tokens.txt`), tokens, 'utf8');
-
-        // chunks
-        const chunks = chunkByTokens(tokens, { minT, maxT, overlap });
-        chunks.forEach((c, i) => {
-          chunksStream.write(JSON.stringify({
-            id: `${base}::${i}`,
-            sha256: rec.sha256 || null,
-            type: 'js',
-            url: rec.url || '',
-            path: rec.path,
-            chunk_index: i,
-            n_tokens: c.n_tokens,
-            text: c.text
-          }) + '\n');
-        });
-        stats.js += 1;
-        stats.chunks += chunks.length;
-
-        if (genAST) {
-          // AST opcional para auditoria
-          const ast = esprima.parseScript(text, { tolerant: true, range: false, loc: false });
-          await fs.writeFile(path.join(outDir, 'ast', `${base}.js.ast.json`), JSON.stringify(ast), 'utf8');
-          stats.ast += 1;
+        // JSONL para embeddings
+        stream.write(JSON.stringify({
+          id: base,
+          sha256: rec.sha256 || null,
+          type: 'js',
+          url: rec.url || '',
+          path: rec.path,
+          text: tokens
+        })+'\n');
+        stats.js++; stats.written++;
+        if(genAST){
+          try{
+            const ast = esprima.parseScript(text, { tolerant: true });
+            await fs.writeFile(path.join(outDir, 'ast', `${base}.js.ast.json`), JSON.stringify(ast), 'utf8');
+            stats.ast++;
+          }catch{}
         }
       }
-
-      if (rec.type === 'wasm') {
+      if(rec.type === 'wasm'){
         const wat = await wasmToWat(rec.path);
-        if (!wat) continue;
-
+        if(!wat) continue;
         const watNorm = normalizeWatText(wat);
         const opseq = watToOpcodeTokens(watNorm);
-
         const base = rec.sha256 || sanitizeBase(rec.url || rec.path);
         await fs.writeFile(path.join(outDir, 'norm', `${base}.wat`), watNorm, 'utf8');
         await fs.writeFile(path.join(outDir, 'norm', `${base}.wat.opseq.txt`), opseq, 'utf8');
-
-        // chunks
-        const chunks = chunkByTokens(opseq, { minT, maxT, overlap });
-        chunks.forEach((c, i) => {
-          chunksStream.write(JSON.stringify({
-            id: `${base}::${i}`,
-            sha256: rec.sha256 || null,
-            type: 'wasm',
-            url: rec.url || '',
-            path: rec.path,
-            chunk_index: i,
-            n_tokens: c.n_tokens,
-            text: c.text
-          }) + '\n');
-        });
-        stats.wasm += 1;
-        stats.chunks += chunks.length;
+        stream.write(JSON.stringify({
+          id: base,
+          sha256: rec.sha256 || null,
+          type: 'wasm',
+          url: rec.url || '',
+          path: rec.path,
+          text: opseq
+        })+'\n');
+        stats.wasm++; stats.written++;
       }
-
-      // Workers salvos pelo crawler aparecem como type "js" no manifest, mas com path em /workers.
-      // Não é preciso tratamento diferente aqui.
-
-    } catch (e) {
-      stats.errors += 1;
-      console.warn(`Falha em ${rec.path}: ${e.message}`);
+    }catch(e){
+      stats.errors++; console.warn(`Falha em ${rec.path}: ${e.message}`);
     }
   }
 
-  chunksStream.end();
-
-  // Relatório sintético
-  const summary = {
-    generated_at: nowIso(),
-    input_crawl_dir: crawlDir,
-    output_dir: outDir,
-    params: { min_tokens: minT, max_tokens: maxT, overlap },
-    stats
-  };
-  await fs.writeFile(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2), 'utf8');
+  stream.end();
+  await fs.writeFile(path.join(outDir, 'summary.json'),
+    JSON.stringify({ generated_at: nowIso(), input_crawl_dir: crawlDir, output_dir: outDir, stats }, null, 2),
+    'utf8'
+  );
 
   console.log('Parser v2 concluído.');
-  console.log(`JS: ${stats.js}  WASM: ${stats.wasm}  CHUNKS: ${stats.chunks}  AST: ${stats.ast}  ERR: ${stats.errors}`);
-  console.log(`Chunks JSONL: ${chunksJSONL}`);
+  console.log(`JS: ${stats.js} WASM: ${stats.wasm} escritos: ${stats.written} AST: ${stats.ast} ERR: ${stats.errors}`);
+  console.log(`JSONL para embeddings: ${outJSONL}`);
 }
 
-// fallback caso não exista manifest.jsonl
-async function fallbackEnumerate(jsDir, wasmDir, workersDir) {
-  const list = [];
-  if (await exists(jsDir)) {
-    for (const f of await fs.readdir(jsDir)) if (f.endsWith('.js'))
-      list.push({ type: 'js', path: path.join(jsDir, f), url: '', sha256: null });
-  }
-  if (await exists(workersDir)) {
-    for (const f of await fs.readdir(workersDir)) if (f.endsWith('.js'))
-      list.push({ type: 'js', path: path.join(workersDir, f), url: '', sha256: null });
-  }
-  if (await exists(wasmDir)) {
-    for (const f of await fs.readdir(wasmDir)) if (f.endsWith('.wasm'))
-      list.push({ type: 'wasm', path: path.join(wasmDir, f), url: '', sha256: null });
-  }
-  return list;
+if(require.main === module){
+  main().catch(err=>{ console.error(err); process.exit(1); });
 }
 
-if (require.main === module) {
-  main().catch(err => { console.error(err); process.exit(1); });
-}
-
-module.exports = {
-  jsToSemanticTokens,
-  normalizeWatText,
-  watToOpcodeTokens,
-  chunkByTokens
-};
+module.exports = { jsToSemanticTokens, normalizeWatText, watToOpcodeTokens };

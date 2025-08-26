@@ -1,0 +1,1 @@
+{"@context":"http://schema.org","@type":"WebSite","name":"WebDollar","alternateName":"WebDollar Currency of the Internet","url":"https://webdollar.io/","potentialAction":{"@type":"SearchAction","query-input":"required"}}

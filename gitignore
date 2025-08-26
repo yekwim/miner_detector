@@ -1,0 +1,78 @@
+# -------------------------
+# Node.js / Parser / Crawler
+# -------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Saídas do crawler
+crawl_output/
+*.html
+*.js
+*.wasm
+
+# -------------------------
+# Python / Treinamento
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Logs
+*.log
+
+# Arquivos temporários
+*.tmp
+*.swp
+.DS_Store
+
+# -------------------------
+# Saídas do Parser / Deobfuscator
+# -------------------------
+deobfuscation_output/
+deobfuscated/
+ast/
+wat/
+wasm_analysis/
+reports/
+summary_report.txt
+
+# -------------------------
+# Embeddings e datasets
+# -------------------------
+embeddings/
+*.parquet
+*.arrow
+*.jsonl
+*.csv
+
+# -------------------------
+# Modelos treinados
+# -------------------------
+models/
+checkpoints/
+*.joblib
+*.pkl
+
+# -------------------------
+# IDE / Editor
+# -------------------------
+.vscode/
+.idea/
+*.iml
+
+# -------------------------
+# Ambiente Virtual
+# -------------------------
+venv/
+.env/
+.venv/
+env/

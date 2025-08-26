@@ -17,12 +17,14 @@ Pipeline de coleta, normalização, embeddings e classificação para detectar m
 ## Fluxo
 
 ### Inferência (produção)
+
 1. `crawler/crawler.js` → gera `data/crawl_output/`.
 2. `parser/parser_v2.js` → gera `data/parser_output/chunks/embeddings_chunks.jsonl`.
 3. `scripts/embed_runner.py` → gera `data/embeddings/`.
 4. `scripts/predict.py` → usa `models/latest/model.joblib` para pontuar.
 
 ### Treinamento (offline)
+
 1. Dataset rotulado em `data/labels/labels.csv`.
 2. `scripts/embed_runner.py` em `data/parser_output/` rotulado.
 3. `scripts/train.py` → salva modelo calibrado em `models/latest/`.
@@ -30,3 +32,16 @@ Pipeline de coleta, normalização, embeddings e classificação para detectar m
 ## Labels
 
 Formato esperado em `data/labels/labels.csv`:
+
+## Execução
+
+Crawler
+`node crawler/crawler.js <url>`
+
+Parser
+`node parser/parser.js data/crawl_output/<url>`
+
+Embed
+`python scripts/embed_runner.py \`
+`--chunks data/parser_output/chunks/embeddings_chunks.jsonl \`
+`--out_dir data/embeddings/`

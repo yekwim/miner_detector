@@ -1,0 +1,9 @@
+torch
+transformers>=4.42
+pandas
+pyarrow
+numpy
+scikit-learn
+tqdm
+joblib
+tiktoken 
