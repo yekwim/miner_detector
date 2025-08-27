@@ -1,1 +1,0 @@
-{"@context":"http://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"item":{"@id":"https://webolldar.io/","name":"Home","image":"https://webdollar.io/public/assets/images/WebDollar-logo-white.png"}}]}
